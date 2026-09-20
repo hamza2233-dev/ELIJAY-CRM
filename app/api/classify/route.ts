@@ -1,17 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { classifyCallWithGemini } from "@/lib/gemini";
-import { getCalls, saveCalls } from "@/lib/store";
+import { readAllCalls, writeAllCalls } from "@/lib/store";
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
     const singleId = body.id || body.callId;
 
-    let calls = await getCalls();
+    let calls = readAllCalls();
 
     let toProcess = singleId
      ? calls.filter((c: any) => c.id === singleId)
-      : calls.filter((c: any) =>!c.qaResult || c.result === "PENDING" || c.qaStatus === "PENDING");
+      : calls.filter((c: any) =>!c.qaResult || c.result === "PENDING" || c.qaStatus === "PENDING" || c.resultStatus === "PENDING");
 
     if (toProcess.length === 0) {
       return NextResponse.json({ message: "No pending calls", processed: 0, remaining: 0 });
@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
       try {
         const transcription = call.transcription || call.transcript || "";
         const meta = {
-          campaign: call.campaign || call.buyer || "unknown",
+          campaign: call.campaign || call.buyer || call.target || "unknown",
           duration: call.duration || call.call_duration || "0"
         };
 
@@ -52,7 +52,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    await saveCalls(calls);
+    writeAllCalls(calls);
 
     const remaining = calls.filter((c: any) =>!c.qaResult || c.qaStatus === "PENDING").length;
 
@@ -69,5 +69,5 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET() {
-  return NextResponse.json({ message: "POST /api/classify to run QA" });
+  return NextResponse.json({ message: "Use POST /api/classify" });
 }
