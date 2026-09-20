@@ -17,48 +17,76 @@ export interface QAClassification {
   score: number;
 }
 
-/**
- * Classifies a single call transcription using Gemini 1.5 Flash.
- * Requires GEMINI_API_KEY to be set in the environment.
- */
+function parseDurationToSeconds(d: any): number {
+  if (!d) return 0
+  if (typeof d === 'number') return d
+  const str = String(d).trim()
+  if (!str) return 0
+  if (!str.includes(":")) {
+    const num = parseFloat(str.replace(/[^0-9.]/g, ""))
+    return isNaN(num)? 0 : Math.floor(num)
+  }
+  const parts = str.split(":").map(p => parseInt(p) || 0)
+  if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2]
+  if (parts.length === 2) return parts[0]*60 + parts[1]
+  return 0
+}
+
 export async function classifyCallWithGemini(
   transcription: string,
   meta: { campaign?: string; duration?: string }
 ): Promise<QAClassification> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not set. Add it to your environment variables.");
+    throw new Error("GEMINI_API_KEY is not set.");
   }
-  if (!transcription || transcription.trim().length < 5) {
-    return { result: "SHORT CALL", reason: "No usable transcription available.", score: 0 };
+
+  const durationSec = parseDurationToSeconds(meta.duration)
+  const wordCount = transcription? transcription.trim().split(/\s+/).length : 0
+
+  // FIX 1: Sirf tabhi SHORT CALL jab duration bhi kam ho AUR transcription bhi khali ho
+  if (durationSec > 0 && durationSec < 30 && wordCount < 15) {
+    return { result: "SHORT CALL", reason: `Too short: ${durationSec}s, ${wordCount} words`, score: 0 };
   }
+
+  // Agar transcription khali hai lekin duration lambi hai to SHORT mat karo, AI ko check karne do
+  const safeTranscription = transcription && transcription.trim().length > 5
+   ? transcription
+    : `[No transcription available, but call duration is ${durationSec} seconds. Use duration and campaign context. If duration > 30s, DO NOT classify as SHORT CALL.]`
 
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-  const prompt = `You are a strict call-center QA analyst for a pay-per-call marketing company.
-Classify the following call transcript into EXACTLY ONE of these categories:
+  const prompt = `You are a strict call-center QA analyst.
+
+Classify into EXACTLY ONE:
 SALE, CALLBACK, NOT INTERESTED, WRONG INTENT, CUSTOMER MISBEHAVE, AGENT MISTAKE, SHORT CALL
 
 Definitions:
-- SALE: the customer agreed to purchase / convert.
-- CALLBACK: the agent needs to call the customer back later.
-- NOT INTERESTED: the customer explicitly declined.
-- WRONG INTENT: the caller wanted something unrelated to the campaign.
-- CUSTOMER MISBEHAVE: the customer was abusive, hostile, or the call was a prank.
-- AGENT MISTAKE: the agent mishandled the call, gave wrong info, or broke script/compliance.
-- SHORT CALL: the call was too short to determine an outcome.
+- SALE: customer agreed to purchase / convert
+- CALLBACK: needs to call back later
+- NOT INTERESTED: customer explicitly declined
+- WRONG INTENT: caller wanted something unrelated
+- CUSTOMER MISBEHAVE: abusive/prank
+- AGENT MISTAKE: agent mishandled, broke compliance
+- SHORT CALL: ONLY if duration < 30 seconds AND almost no conversation (<15 words). NEVER use SHORT CALL if duration > 30s.
 
 Campaign: ${meta.campaign || "unknown"}
-Duration: ${meta.duration || "unknown"}
+Duration: ${durationSec} seconds (${durationSec} is the real duration, use this)
+Word Count: ${wordCount}
 
 Transcript:
 """
-${transcription.slice(0, 12000)}
+${safeTranscription.slice(0, 12000)}
 """
 
-Respond with ONLY minified JSON, no markdown, no code fences, in exactly this shape:
-{"result":"<one of the categories above>","reason":"<one sentence reason>","score":<integer 0-100 call quality score>}`;
+CRITICAL RULES:
+- If Duration > 30 seconds, YOU ARE FORBIDDEN from returning SHORT CALL. Choose from other 6 categories.
+- If transcript shows real conversation, NEVER return SHORT CALL.
+- SHORT CALL is only for calls <30s with no real talk.
+
+Respond ONLY minified JSON:
+{"result":"<category>","reason":"<one sentence>","score":<0-100>}`;
 
   const response = await model.generateContent(prompt);
   const text = response.response.text().trim();
@@ -66,10 +94,17 @@ Respond with ONLY minified JSON, no markdown, no code fences, in exactly this sh
 
   try {
     const parsed = JSON.parse(cleaned);
-    const result: QAResult = VALID_RESULTS.includes(parsed.result) ? parsed.result : "SHORT CALL";
-    const score = Math.max(0, Math.min(100, Number(parsed.score) || 0));
+    let result: QAResult = VALID_RESULTS.includes(parsed.result)? parsed.result : "WRONG INTENT";
+
+    // FIX 2: Safety net - if AI still returns SHORT CALL but duration >30s, force to REVIEW
+    if (result === "SHORT CALL" && durationSec > 30) {
+      result = "CALLBACK" // or REVIEW if you have it, but in your list use CALLBACK as fallback
+    }
+
+    const score = Math.max(0, Math.min(100, Number(parsed.score) || 50));
     return { result, reason: String(parsed.reason || "").slice(0, 500), score };
   } catch {
-    return { result: "SHORT CALL", reason: "Could not parse AI response.", score: 0 };
+    // FIX 3: Parse fail par SHORT CALL nahi, WRONG INTENT bhejo taake dubara check ho sake
+    return { result: "WRONG INTENT", reason: `AI parse failed. Raw: ${cleaned.slice(0,100)}`, score: 50 };
   }
 }
