@@ -1,0 +1,137 @@
+"use client";
+
+import { useEffect, useMemo, useState, useRef } from "react";
+import { motion } from "framer-motion";
+import { UploadCloud, Sparkles, Loader2, CheckCircle2 } from "lucide-react";
+import DashboardHeader from "@/components/DashboardHeader";
+import StatsRow from "@/components/StatsRow";
+import Filters from "@/components/Filters";
+import DataTable from "@/components/DataTable";
+import GlassCard from "@/components/GlassCard";
+import { CallRecord } from "@/lib/types";
+
+export default function AdminDashboard() {
+  const [calls, setCalls] = useState<CallRecord[]>([]);
+  const [id, setId] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [active, setActive] = useState("ALL");
+  const [uploading, setUploading] = useState(false);
+  const [classifying, setClassifying] = useState(false);
+  const [message, setMessage] = useState("");
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const loadCalls = () => {
+    setLoading(true);
+    fetch("/api/calls")
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.ok) {
+          setCalls(data.calls);
+          setId(data.id);
+        }
+        setLoading(false);
+      });
+  };
+
+  useEffect(loadCalls, []);
+
+  const filtered = useMemo(() => {
+    return calls.filter((c) => {
+      const matchesActive = active === "ALL" || c.qaResult === active;
+      const s = search.toLowerCase();
+      const matchesSearch =
+        !s ||
+        c.callerId?.toLowerCase().includes(s) ||
+        c.number?.toLowerCase().includes(s) ||
+        c.campaign?.toLowerCase().includes(s) ||
+        c.publisher?.toLowerCase().includes(s) ||
+        c.target?.toLowerCase().includes(s);
+      return matchesActive && matchesSearch;
+    });
+  }, [calls, active, search]);
+
+  const pendingCount = calls.filter((c) => c.qaResult === "PENDING").length;
+
+  const onUpload = async () => {
+    const file = fileRef.current?.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setMessage("");
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/api/upload", { method: "POST", body: form });
+    const data = await res.json();
+    setUploading(false);
+    if (data.ok) {
+      setMessage(`Imported ${data.imported} calls. Total: ${data.total}.`);
+      loadCalls();
+    } else {
+      setMessage(data.error || "Upload failed.");
+    }
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  const onClassify = async () => {
+    setClassifying(true);
+    setMessage("");
+    const res = await fetch("/api/classify", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const data = await res.json();
+    setClassifying(false);
+    if (data.ok) {
+      setMessage(
+        `AI QA processed ${data.processed} call(s). ${data.remaining} still pending — click again to continue.`
+      );
+      loadCalls();
+    } else {
+      setMessage(data.error || "Classification failed.");
+    }
+  };
+
+  return (
+    <div className="min-h-screen pb-16">
+      <DashboardHeader role="Admin" id={id || "..."} />
+      <main className="mx-auto max-w-7xl space-y-6 px-6 py-8">
+        <StatsRow calls={calls} />
+
+        <GlassCard className="flex flex-col gap-4 p-6 md:flex-row md:items-center md:justify-between">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+            <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-dashed border-white/20 bg-white/5 px-4 py-2.5 text-sm text-white/70 transition hover:border-purple-400/60 hover:bg-white/10">
+              <UploadCloud size={16} />
+              <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={onUpload} />
+              {uploading ? "Uploading..." : "Upload Call CSV"}
+              {uploading && <Loader2 size={14} className="animate-spin" />}
+            </label>
+
+            <motion.button
+              whileHover={{ scale: 1.03 }}
+              whileTap={{ scale: 0.97 }}
+              onClick={onClassify}
+              disabled={classifying || pendingCount === 0}
+              className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-purple-500 to-teal-400 px-4 py-2.5 text-sm font-medium text-white shadow-md transition disabled:opacity-40"
+            >
+              {classifying ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
+              {classifying ? "Running AI QA..." : `Run AI QA (${pendingCount} pending)`}
+            </motion.button>
+          </div>
+
+          {message && (
+            <div className="flex items-center gap-2 text-xs text-white/60">
+              <CheckCircle2 size={14} className="text-emerald-400" />
+              {message}
+            </div>
+          )}
+        </GlassCard>
+
+        <GlassCard className="space-y-5 p-6">
+          <Filters search={search} onSearch={setSearch} active={active} onActive={setActive} />
+          {loading ? (
+            <p className="py-10 text-center text-white/40">Loading calls...</p>
+          ) : (
+            <DataTable calls={filtered} />
+          )}
+        </GlassCard>
+      </main>
+    </div>
+  );
+}
