@@ -1,90 +1,69 @@
-import { GoogleGenerativeAI } from "@google/generative-ai"
+import { NextRequest, NextResponse } from "next/server";
+import { classifyCallWithGemini } from "@/lib/gemini";
+import { getCalls, saveCalls } from "@/lib/storage"; // agar aapka storage alag hai to batao
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json().catch(() => ({}));
+    const singleId = body.id || body.callId;
 
-function parseDurationToSeconds(d: any): number {
-  if (!d) return 0
-  if (typeof d === 'number') return d
-  const str = String(d).trim()
-  if (!str.includes(":")) return parseInt(str) || 0
-  const parts = str.split(":").map(n => parseInt(n) || 0)
-  if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2]
-  if (parts.length === 2) return parts[0]*60 + parts[1]
-  return 0
-}
+    let calls = await getCalls();
 
-export async function classifyCallWithGemini(
-  transcription: string,
-  meta: { campaign: string, duration: any }
-) {
-  const durationSec = parseDurationToSeconds(meta.duration)
+    let toProcess = singleId 
+      ? calls.filter((c: any) => c.id === singleId)
+      : calls.filter((c: any) => c.qaStatus === "PENDING" || c.result === "PENDING");
 
-  // FIXED LOGIC: Very strict short call check
-  const wordCount = transcription? transcription.trim().split(/\s+/).length : 0
-
-  // Only mark as SHORT_CALL if BOTH conditions
-  if (durationSec > 0 && durationSec < 30 && wordCount < 20) {
-    return {
-      result: "SHORT_CALL",
-      reason: `Call too short: ${durationSec}s, only ${wordCount} words`,
-      score: 0
+    if (toProcess.length === 0) {
+      return NextResponse.json({ message: "No pending calls", processed: 0 });
     }
-  }
 
-  // If transcription is empty but duration is long, don't mark short, let AI decide
-  if (!transcription || wordCount < 5) {
-    if (durationSec > 0 && durationSec < 15) {
-      return {
-        result: "SHORT_CALL",
-        reason: `No conversation, duration ${durationSec}s`,
-        score: 0
+    // Vercel timeout se bachne ke liye max 15 per request
+    const MAX_PER_RUN = singleId ? 1 : 15;
+    toProcess = toProcess.slice(0, MAX_PER_RUN);
+
+    for (const call of toProcess) {
+      try {
+        const transcription = call.transcription || call.transcript || "";
+        const meta = {
+          campaign: call.campaign || call.buyer || "unknown",
+          duration: call.duration || call.call_duration || "0"
+        };
+
+        const qa = await classifyCallWithGemini(transcription, meta);
+
+        call.qaResult = qa.result;
+        call.result = qa.result;
+        call.qaReason = qa.reason;
+        call.reason = qa.reason;
+        call.qaScore = qa.score;
+        call.score = qa.score;
+        call.qaStatus = "DONE";
+        
+        // Delay to avoid Gemini rate limit
+        await new Promise(r => setTimeout(r, 800));
+
+      } catch (err: any) {
+        console.error("QA failed for", call.id, err);
+        call.qaStatus = "PENDING";
+        call.qaReason = err.message;
       }
     }
+
+    await saveCalls(calls);
+
+    return NextResponse.json({ 
+      success: true, 
+      processed: toProcess.length,
+      remaining: calls.filter((c:any) => c.qaStatus === "PENDING").length
+    });
+
+  } catch (error: any) {
+    console.error("Classify API error:", error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
-
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" })
-
-  const prompt = `
-You are a QA analyst for Medicare / ACA calls. Campaign: ${meta.campaign || "Unknown"}
-Call Duration: ${durationSec} seconds
-Transcription: """
-${transcription || "No transcription provided"}
-"""
-
-RULES - VERY IMPORTANT:
-1. DO NOT mark as SHORT_CALL just because duration is short. Only mark SHORT_CALL if duration < 30s AND transcription has <20 words.
-2. If transcription shows a real conversation (agent and customer talking), ALWAYS do full QA. Never mark as SHORT_CALL.
-3. QA Criteria:
-   - If agent is selling / misleading / not following script -> FAIL
-   - If call is good quality, customer interested -> PASS
-   - If not sure -> REVIEW
-
-Return ONLY JSON in this format:
-{
-  "result": "PASS" | "FAIL" | "REVIEW" | "SHORT_CALL",
-  "reason": "short explanation in 1-2 lines",
-  "score": 0-100
 }
-`
 
-  const result = await model.generateContent(prompt)
-  const text = result.response.text()
-
-  try {
-    const jsonMatch = text.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) throw new Error("No JSON found")
-    const parsed = JSON.parse(jsonMatch[0])
-    return {
-      result: parsed.result || "REVIEW",
-      reason: parsed.reason || text.slice(0, 200),
-      score: parsed.score?? 50
-    }
-  } catch (e) {
-    console.error("Gemini parse error:", text)
-    return {
-      result: "REVIEW",
-      reason: "AI response parse failed: " + text.slice(0, 200),
-      score: 50
-    }
-  }
+// GET bhi allow karo taake 405 na aaye
+export async function GET() {
+  return NextResponse.json({ message: "Use POST to classify" });
 }
