@@ -1,73 +1,63 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getSession } from "@/lib/session";
+import { readAllCalls, updateCall } from "@/lib/store";
 import { classifyCallWithGemini } from "@/lib/gemini";
-import { readAllCalls, writeAllCalls } from "@/lib/store";
+import { syncCallsToSheets } from "@/lib/sheets";
 
+// Allow this function to run longer than the Next.js default (10s) so each
+// batch has room to call Gemini multiple times in sequence. Vercel Hobby
+// projects are capped at 60s for this value; Pro/Enterprise can go higher.
+// If you're on Hobby and still see timeouts, lower MAX_PER_RUN below instead.
+export const maxDuration = 60;
+
+// Classifies PENDING calls in batches (or a single call if `id` is provided).
+// Admin-only. The dashboard calls this endpoint in a loop (see
+// app/admin/dashboard/page.tsx) until `remaining` is 0, so from the user's
+// perspective clicking "Run AI QA" once processes every call — batching here
+// just keeps each individual serverless invocation short enough to avoid
+// hitting Vercel's function time limit or Gemini's rate limits.
 export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json().catch(() => ({}));
-    const singleId = body.id || body.callId;
-
-    let calls = readAllCalls();
-
-    let toProcess = singleId
-     ? calls.filter((c: any) => c.id === singleId)
-      : calls.filter((c: any) =>!c.qaResult || c.result === "PENDING" || c.qaStatus === "PENDING" || c.resultStatus === "PENDING");
-
-    if (toProcess.length === 0) {
-      return NextResponse.json({ message: "No pending calls", processed: 0, remaining: 0 });
-    }
-
-    const MAX_PER_RUN = singleId? 1 : 15;
-    toProcess = toProcess.slice(0, MAX_PER_RUN);
-
-    for (const call of toProcess) {
-      try {
-        const transcription = call.transcription || call.transcript || "";
-        const meta = {
-          campaign: call.campaign || call.buyer || call.target || "unknown",
-          duration: call.duration || call.call_duration || "0"
-        };
-
-        const qa = await classifyCallWithGemini(transcription, meta);
-
-        const idx = calls.findIndex((x: any) => x.id === call.id);
-        if (idx >= 0) {
-          calls[idx] = {
-           ...calls[idx],
-            qaResult: qa.result,
-            result: qa.result,
-            qaReason: qa.reason,
-            reason: qa.reason,
-            qaScore: qa.score,
-            score: qa.score,
-            qaStatus: "DONE",
-            resultStatus: "DONE"
-          };
-        }
-
-        await new Promise(r => setTimeout(r, 800));
-
-      } catch (err: any) {
-        console.error("QA failed for", call.id, err.message);
-      }
-    }
-
-    writeAllCalls(calls);
-
-    const remaining = calls.filter((c: any) =>!c.qaResult || c.qaStatus === "PENDING").length;
-
-    return NextResponse.json({
-      success: true,
-      processed: toProcess.length,
-      remaining
-    });
-
-  } catch (error: any) {
-    console.error("Classify API error:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  const session = await getSession();
+  if (!session || session.role !== "admin") {
+    return NextResponse.json({ ok: false, error: "Admin access required" }, { status: 403 });
   }
-}
 
-export async function GET() {
-  return NextResponse.json({ message: "Use POST /api/classify" });
+  const body = await req.json().catch(() => ({}));
+  const singleId: string | undefined = body?.id;
+
+  const all = readAllCalls();
+  const targets = singleId ? all.filter((c) => c.id === singleId) : all.filter((c) => c.qaResult === "PENDING");
+
+  const MAX_PER_RUN = singleId ? 1 : 20; // keep each request short-lived on serverless
+  const batch = targets.slice(0, MAX_PER_RUN);
+
+  const results: { id: string; ok: boolean; error?: string }[] = [];
+
+  for (const call of batch) {
+    try {
+      const classification = await classifyCallWithGemini(call.transcription, {
+        campaign: call.campaign,
+        duration: call.duration
+      });
+      updateCall(call.id, {
+        qaResult: classification.result,
+        qaReason: classification.reason,
+        qaScore: classification.score
+      });
+      results.push({ id: call.id, ok: true });
+    } catch (e: any) {
+      results.push({ id: call.id, ok: false, error: e.message });
+    }
+  }
+
+  const updatedAll = readAllCalls();
+  const sync = await syncCallsToSheets(updatedAll).catch((e) => ({ synced: false, reason: e.message }));
+
+  return NextResponse.json({
+    ok: true,
+    processed: results.length,
+    remaining: Math.max(0, targets.length - batch.length),
+    results,
+    sync
+  });
 }
