@@ -72,20 +72,53 @@ export default function AdminDashboard() {
     if (fileRef.current) fileRef.current.value = "";
   };
 
+  // Runs /api/classify repeatedly until every PENDING call has been
+  // classified. Each request only handles a bounded batch server-side (to
+  // stay inside serverless time limits), so this loop is what makes one
+  // click actually cover *all* calls instead of just the first batch.
   const onClassify = async () => {
     setClassifying(true);
     setMessage("");
-    const res = await fetch("/api/classify", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    const data = await res.json();
-    setClassifying(false);
-    if (data.ok) {
-      setMessage(
-        `AI QA processed ${data.processed} call(s). ${data.remaining} still pending — click again to continue.`
-      );
-      loadCalls();
-    } else {
-      setMessage(data.error || "Classification failed.");
+    let totalProcessed = 0;
+    let safety = 0; // hard stop in case something is stuck, so we never loop forever
+
+    try {
+      while (safety < 100) {
+        safety += 1;
+        const res = await fetch("/api/classify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}"
+        });
+
+        let data: any;
+        try {
+          data = await res.json();
+        } catch {
+          setMessage(`Request failed (status ${res.status}). Check Vercel function logs for /api/classify.`);
+          break;
+        }
+
+        if (!data.ok) {
+          setMessage(data.error || `Classification failed (status ${res.status}).`);
+          break;
+        }
+
+        totalProcessed += data.processed;
+        setMessage(`AI QA in progress... ${totalProcessed} call(s) processed so far.`);
+        loadCalls();
+
+        if (data.remaining === 0 || data.processed === 0) {
+          setMessage(`AI QA complete — ${totalProcessed} call(s) classified.`);
+          break;
+        }
+      }
+    } catch (e: any) {
+      setMessage(e?.message || "Classification failed — check your network connection.");
     }
+
+    setClassifying(false);
+    loadCalls();
   };
 
   return (
